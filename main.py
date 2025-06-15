@@ -8,14 +8,15 @@ import platform
 import time
 import colorama
 
-if platform.system() == "Windows": # I need to change those but I"m too lazy rn.
-    GREEN = ""
-    RED = ""
-    YELLOW = ""
-    CYAN = ""
-    MAGENTA = ""
-    RESET = ""
+if platform.system() == "Windows":
     colorama.init()
+    from colorama import Fore, Style
+    GREEN = Fore.GREEN
+    RED = Fore.RED
+    YELLOW = Fore.YELLOW
+    CYAN = Fore.CYAN
+    MAGENTA = Fore.MAGENTA
+    RESET = Style.RESET_ALL
 else:
     GREEN = "\033[92m"
     RED = "\033[91m"
