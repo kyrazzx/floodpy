@@ -37,7 +37,7 @@ ___________.__                    .__________________.___.
 {RESET}"""
 print(banner)
 
-DEFAULT_THREADS = 500
+DEFAULT_THREADS = 1000
 
 while True:
     try:
